@@ -53,7 +53,7 @@ export async function fetchYouTube(videoId: string, timeoutMs: number): Promise<
 
 		const description = extractDescription(html);
 
-		const { transcript, reason } = await tryTranscript(html, timeoutMs);
+		const { transcript, reason } = await tryTranscript(videoId, html, timeoutMs);
 		if (!transcript && reason) meta.transcriptReason = reason;
 
 		const body: string[] = [];
@@ -135,15 +135,83 @@ interface TranscriptAttempt {
 	reason: string | null;
 }
 
-async function tryTranscript(html: string, timeoutMs: number): Promise<TranscriptAttempt> {
-	const tracks = extractCaptionTracks(html);
+async function tryTranscript(
+	videoId: string,
+	html: string,
+	timeoutMs: number,
+): Promise<TranscriptAttempt> {
+	const innertubeTracks = await fetchInnertubeCaptionTracks(videoId, timeoutMs);
+	const htmlTracks = extractCaptionTracks(html);
+	const tracks = innertubeTracks.length > 0 ? innertubeTracks : htmlTracks;
+
 	if (tracks.length === 0) {
 		return { transcript: "", reason: "no caption tracks (video has no captions)" };
 	}
+
 	const track = pickTrack(tracks);
-	const text = await fetchTranscript(track.baseUrl, timeoutMs);
-	if (!text) return { transcript: "", reason: "caption fetch empty" };
-	return { transcript: text, reason: null };
+	const source = innertubeTracks.length > 0 ? "innertube" : "html";
+
+	const srv1 = await fetchTranscript(forceFormat(track.baseUrl, "srv1"), timeoutMs, "xml");
+	if (srv1.text) return { transcript: srv1.text, reason: null };
+
+	const json3 = await fetchTranscript(forceFormat(track.baseUrl, "json3"), timeoutMs, "json3");
+	if (json3.text) return { transcript: json3.text, reason: null };
+
+	return {
+		transcript: "",
+		reason: `empty (src=${source} srv1=${srv1.diagnostic} json3=${json3.diagnostic})`,
+	};
+}
+
+async function fetchInnertubeCaptionTracks(videoId: string, timeoutMs: number): Promise<CaptionTrack[]> {
+	try {
+		const res = await Promise.race([
+			requestUrl({
+				url: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+				method: "POST",
+				headers: {
+					...BROWSER_HEADERS,
+					"Content-Type": "application/json",
+					"X-YouTube-Client-Name": "1",
+					"X-YouTube-Client-Version": "2.20250101.00.00",
+				},
+				body: JSON.stringify({
+					context: {
+						client: {
+							clientName: "WEB",
+							clientVersion: "2.20250101.00.00",
+							hl: "en",
+							gl: "US",
+						},
+					},
+					videoId,
+				}),
+				throw: false,
+			}),
+			new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
+		]);
+		if (res.status < 200 || res.status >= 300) return [];
+		const json = res.json as {
+			captions?: {
+				playerCaptionsTracklistRenderer?: {
+					captionTracks?: Array<{ baseUrl: string; languageCode: string; kind?: string }>;
+				};
+			};
+		};
+		const tracks = json.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+		return tracks.map((t) => ({
+			baseUrl: t.baseUrl,
+			languageCode: t.languageCode,
+			kind: t.kind,
+		}));
+	} catch {
+		return [];
+	}
+}
+
+function forceFormat(baseUrl: string, fmt: "srv1" | "json3"): string {
+	const url = baseUrl.replace(/([&?])fmt=[^&]*/g, "$1").replace(/[&?]$/, "");
+	return url + (url.includes("?") ? "&" : "?") + "fmt=" + fmt;
 }
 
 interface CaptionTrack {
@@ -179,18 +247,53 @@ function pickTrack(tracks: CaptionTrack[]): CaptionTrack {
 	return tracks[0];
 }
 
-async function fetchTranscript(baseUrl: string, timeoutMs: number): Promise<string> {
+interface TranscriptFetch {
+	text: string;
+	diagnostic: string;
+}
+
+async function fetchTranscript(
+	url: string,
+	timeoutMs: number,
+	kind: "xml" | "json3",
+): Promise<TranscriptFetch> {
 	try {
 		const res = await Promise.race([
-			requestUrl({ url: baseUrl, headers: BROWSER_HEADERS, throw: false }),
+			requestUrl({ url, headers: BROWSER_HEADERS, throw: false }),
 			new Promise<never>((_, rej) => setTimeout(() => rej(new Error("timeout")), timeoutMs)),
 		]);
-		if (res.status < 200 || res.status >= 300) return "";
-		const xml = res.text ?? "";
-		const segments = [...xml.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)].map((m) => decodeHtml(m[1]));
-		return segments.join(" ").replace(/\s+/g, " ").trim();
-	} catch {
-		return "";
+		if (res.status < 200 || res.status >= 300) {
+			return { text: "", diagnostic: `http ${res.status}` };
+		}
+		const body = res.text ?? "";
+		if (!body.trim()) return { text: "", diagnostic: "empty body" };
+
+		if (kind === "xml") {
+			const segments = [...body.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)].map((m) =>
+				decodeHtml(m[1]),
+			);
+			const text = segments.join(" ").replace(/\s+/g, " ").trim();
+			return { text, diagnostic: text ? "ok" : `0 segments in ${body.length}B` };
+		}
+
+		try {
+			const json = JSON.parse(body) as { events?: Array<{ segs?: Array<{ utf8?: string }> }> };
+			const events = json.events ?? [];
+			const parts: string[] = [];
+			for (const ev of events) {
+				if (!ev.segs) continue;
+				for (const seg of ev.segs) {
+					if (seg.utf8) parts.push(seg.utf8);
+				}
+			}
+			const text = parts.join(" ").replace(/\s+/g, " ").trim();
+			return { text, diagnostic: text ? "ok" : `0 events in ${body.length}B` };
+		} catch (e) {
+			return { text: "", diagnostic: "json parse failed" };
+		}
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return { text: "", diagnostic: msg };
 	}
 }
 

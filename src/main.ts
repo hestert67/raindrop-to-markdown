@@ -16,6 +16,12 @@ export default class RaindropToMarkdownPlugin extends Plugin {
 		});
 
 		this.addCommand({
+			id: "list-collections",
+			name: "List Raindrop collections (shows IDs)",
+			callback: () => this.listCollections(),
+		});
+
+		this.addCommand({
 			id: "dry-run-10",
 			name: "Dry run — import 10 bookmarks",
 			callback: () => this.runSyncWithErrorHandling({ limit: 10 }),
@@ -42,6 +48,30 @@ export default class RaindropToMarkdownPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	private async listCollections() {
+		if (!this.settings.apiToken) {
+			new Notice("No API token set. Open plugin settings first.");
+			return;
+		}
+		try {
+			const api = new RaindropAPI(this.settings.apiToken);
+			const collections = await api.listCollections();
+			const sorted = [...collections].sort((a, b) => b.count - a.count);
+			const lines = sorted.map((c) => `${c._id}\t${c.count}\t${c.title}`);
+			const summary = lines.slice(0, 10).join("\n");
+			console.log("[raindrop-to-markdown] Collections (ID / count / title):");
+			console.log("0\t(all)\tAll bookmarks");
+			console.log(lines.join("\n"));
+			new Notice(
+				`Found ${collections.length} collections. Top 10:\n${summary}\n(Full list in Developer Console.)`,
+				15000,
+			);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			new Notice(`List collections failed: ${msg}`);
+		}
 	}
 
 	private async testConnection() {
